@@ -218,12 +218,11 @@ async function handleDocument(bot, msg, cfg) {
 async function readDocumentFromBuffer(buffer, filename) {
   const ext = path.extname(filename).toLowerCase();
   if (ext === '.docx') {
-    const { extractFormattingFromDocx } = require('../lib/docx-handler');
-    const mammoth = require('mammoth');
-    const result = await mammoth.extractRawText({ buffer });
+    const { extractFormattingFromDocx, extractTextFromDocx } = require('../lib/docx-handler');
+    const text = await extractTextFromDocx(buffer);
     const formatting = await extractFormattingFromDocx(buffer);
     return {
-      text: result.value,
+      text,
       format: 'docx',
       formatting: {
         font: formatting.font,
