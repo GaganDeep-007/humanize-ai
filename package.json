@@ -1,0 +1,24 @@
+{
+  "name": "humanize-ai",
+  "version": "1.1.0",
+  "description": "AI-content / plagiarism scoring + humanization, with Telegram bot and LM Studio/OpenRouter routing",
+  "main": "bin/humanize-ai",
+  "scripts": {
+    "bot": "node bot/index.js",
+    "cli": "node bin/humanize-ai",
+    "test": "node tests/test-adaptive-weight.js && node tests/test-clever-rewrite.js && node tests/test-detector.js && node scripts/check-length-invariance.js"
+  },
+  "bin": {
+    "humanize-ai": "bin/humanize-ai",
+    "humanize-bot": "bot/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "docx": "^9.7.1",
+    "mammoth": "^1.12.2",
+    "pdf-parse": "^2.4.5"
+  }
+}

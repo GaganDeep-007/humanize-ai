@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Runtime data: user documents, scoring memory, maintenance logs
+storage/*
+!storage/.gitkeep
+
+# Python (Laya service)
+__pycache__/
+*.pyc
+laya-service/__pycache__/
+
+# Secrets / local environment
+.env
+.env.*
+*.local
+*.pem
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
