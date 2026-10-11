@@ -17,8 +17,8 @@
   },
   "license": "MIT",
   "dependencies": {
-    "docx": "^9.7.1",
-    "mammoth": "^1.12.2",
+    "docx": "^9.9.0",
+    "mammoth": "^1.13.0",
     "pdf-parse": "^2.4.5"
   }
 }
