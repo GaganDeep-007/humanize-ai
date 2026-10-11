@@ -1,0 +1,370 @@
+#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const { loadConfig, resolveApiKey, saveConfig, resolveProviderKey, CONFIG_PATH } = require('../lib/config');
+const { robustAnalyze } = require('../lib/analyzer');
+const { humanize, writeComparableReport } = require('../lib/humanizer');
+const { readDocument, writeHumanizedDocx, writeDocx, humanizeDocxPreserve } = require('../lib/docx-handler');
+const { FREE_PROVIDERS } = require('../lib/provider');
+
+function readInput(arg) {
+  if (!arg || arg === '-') return fs.readFileSync(0, 'utf8');
+  if (fs.existsSync(arg)) return fs.readFileSync(arg, 'utf8');
+  return arg;
+}
+
+const USAGE = `humanize-ai — humanize AI text and measure AI/plagiarism likelihood
+
+USAGE
+  humanize-ai login                          save config (uses existing ori/OpenRouter credentials)
+  humanize-ai config --model <id>            set model (default openrouter/free)
+  humanize-ai config --ai-threshold <pct>    set your acceptable AI % (default 25)
+  humanize-ai config --plagiarism-threshold <pct>  (default 15)
+  humanize-ai config --style <voice>         normal | clear-structured (default normal)
+  humanize-ai analyze <file|text|->         score original text
+  humanize-ai humanize <file|text|-> [-o out.docx] [--format docx|txt] [--style normal|clear-structured]
+  humanize-ai report <file|text|->          humanize + print before/after report
+  humanize-ai bot-setup --token <T> --id <uid>  set Telegram bot token + your user id
+  humanize-ai providers                        list free fallback providers + key status
+  humanize-ai providers --set <name> <key>     save a provider API key (groq|gemini|cerebras|mistral)
+  humanize-ai providers --disable <name>       disable a provider
+  humanize-ai providers --enable <name>        re-enable a provider
+  humanize-ai detector                         show AI-detector (judge) status
+  humanize-ai detector --set <key>             save detector API key (current provider)
+  humanize-ai detector --provider <name>       sapling|huggingface|contentdetector|kiprio|wasitai|gptzero
+  humanize-ai detector --check                 verify the key can make billable calls
+  humanize-ai detector --enable|--disable      toggle the detector judge
+  humanize-ai bot                            run the Telegram bot (foreground)
+
+OUTPUT FORMAT
+  Default output is .docx (preserves original fonts and sizes).
+  Use --format txt for plain text output.`;
+
+async function main() {
+  const args = process.argv.slice(2);
+  const cmd = args[0];
+
+  if (!cmd || ['help', '--help', '-h'].includes(cmd)) { console.log(USAGE); return; }
+
+  const cfg = loadConfig();
+
+  if (cmd === 'login') {
+    const key = resolveApiKey();
+    if (key) {
+      const final = saveConfig({});
+      console.log('Config saved to ' + CONFIG_PATH);
+      console.log('Model: ' + final.model);
+      console.log('AI threshold: ' + final.aiThreshold + '% | Plagiarism threshold: ' + final.plagiarismThreshold + '%');
+    } else {
+      console.error('No OpenRouter credential found. Run `ori login` first.');
+      process.exit(1);
+    }
+    return;
+  }
+
+  if (cmd === 'config') {
+    const patch = {};
+    for (let i = 1; i < args.length; i++) {
+      if (args[i] === '--model' && args[i + 1]) { patch.model = args[i + 1]; i++; }
+      else if (args[i] === '--ai-threshold' && args[i + 1]) { patch.aiThreshold = Number(args[i + 1]); i++; }
+      else if (args[i] === '--plagiarism-threshold' && args[i + 1]) { patch.plagiarismThreshold = Number(args[i + 1]); i++; }
+      else if (args[i] === '--style' && args[i + 1]) {
+        const v = args[i + 1].toLowerCase();
+        if (!['normal', 'clear-structured'].includes(v)) {
+          console.error('Invalid style. Valid: normal, clear-structured');
+          process.exit(1);
+        }
+        patch.style = v;
+        i++;
+      }
+    }
+    const final = saveConfig(patch);
+    console.log('Saved: ' + JSON.stringify(final));
+    return;
+  }
+
+  if (cmd === 'bot-setup') {
+    const patch = {};
+    for (let i = 1; i < args.length; i++) {
+      if (args[i] === '--token' && args[i + 1]) { patch.bot = { ...(patch.bot || {}), token: args[i + 1] }; i++; }
+      else if (args[i] === '--id' && args[i + 1]) { patch.bot = { ...(patch.bot || {}), allowedIds: [Number(args[i + 1])] }; i++; }
+    }
+    if (!patch.bot) {
+      console.error('Usage: humanize-ai bot-setup --token <TOKEN> --id <your-telegram-user-id>');
+      process.exit(1);
+    }
+    const final = saveConfig(patch);
+    console.log('Bot config saved.');
+    console.log('Token: ' + (final.bot.token ? 'set' : 'NOT SET'));
+    console.log('Allowed user IDs: ' + JSON.stringify(final.bot.allowedIds));
+    console.log('\nThen run: humanize-ai bot');
+    return;
+  }
+
+  if (cmd === 'bot') {
+    require('../bot/index');
+    return;
+  }
+
+  if (cmd === 'providers') {
+    const nameIdx = args.indexOf('--set');
+    if (nameIdx !== -1 && args[nameIdx + 2]) {
+      const name = args[nameIdx + 1].toLowerCase();
+      const key = args[nameIdx + 2];
+      const valid = FREE_PROVIDERS.some(p => p.name === name);
+      if (!valid) {
+        console.error(`Unknown provider: ${name}. Valid: ${FREE_PROVIDERS.map(p => p.name).join(', ')}`);
+        process.exit(1);
+      }
+      const patch = { providers: { [name]: { ...cfg.providers[name], apiKey: key, enabled: true } } };
+      saveConfig(patch);
+      console.log(`✅ ${name} API key saved. Restart the bot: systemctl --user restart humanize-bot`);
+      return;
+    }
+
+    const disIdx = args.indexOf('--disable');
+    if (disIdx !== -1 && args[disIdx + 1]) {
+      const name = args[disIdx + 1].toLowerCase();
+      saveConfig({ providers: { [name]: { ...cfg.providers[name], enabled: false } } });
+      console.log(`⛔ ${name} disabled.`);
+      return;
+    }
+
+    const enIdx = args.indexOf('--enable');
+    if (enIdx !== -1 && args[enIdx + 1]) {
+      const name = args[enIdx + 1].toLowerCase();
+      saveConfig({ providers: { [name]: { ...cfg.providers[name], enabled: true } } });
+      console.log(`✅ ${name} enabled.`);
+      return;
+    }
+
+    console.log('Free fallback providers (auto-rotated on rate limit/failure):');
+    console.log('─'.repeat(50));
+    for (const p of FREE_PROVIDERS) {
+      const key = resolveProviderKey(p.name, cfg);
+      const enabled = cfg.providers?.[p.name]?.enabled !== false;
+      const enabledStr = enabled ? 'on' : 'OFF';
+      const keyStr = key ? 'key set ✔' : 'no key ✘';
+      console.log(`  ${p.name.padEnd(9)} [${enabledStr}] ${keyStr.padEnd(10)}  models: ${p.models.join(', ')}`);
+      console.log(`    signup: ${p.signupUrl}`);
+    }
+    console.log('');
+    console.log('Add a key:  humanize-ai providers --set groq gsk_xxx');
+    console.log('Disable:     humanize-ai providers --disable groq');
+    return;
+  }
+
+  if (cmd === 'detector') {
+    const { detectorStatus, checkAccount, PROVIDERS } = require('../lib/detector');
+    if (args.includes('--check')) {
+      const cfgC = loadConfig();
+      const st = detectorStatus(cfgC);
+      const acct = await checkAccount(cfgC);
+      const { detect } = require('../lib/detector');
+      let probe;
+      try {
+        const d = await detect('The quick brown fox jumps over the lazy dog while the sun sets over the hills. I read a good book yesterday and drank coffee in the garden.', { cfg: cfgC });
+        probe = { ok: true, provider: d.provider.replace(/^detector:/, ''), ai: d.ai_likelihood };
+      } catch (e) { probe = { ok: false, error: e.message }; }
+      console.log(`AI detector account check (${acct.provider}):`);
+      if (acct.error) {
+        console.log(`  ❌ ${acct.error}`);
+      } else if (acct.ok) {
+        if (acct.probeAi != null) {
+          console.log(`  ✅ key works — live probe scored sample text ${acct.probeAi}% AI`);
+        } else {
+          console.log('  ✅ key can make billable calls now');
+          if (acct.usage) console.log(`  usage: ${acct.usage.chars_this_month}/${acct.usage.monthly_quota_chars ?? '∞'} chars this month`);
+        }
+      } else {
+        const reason = acct.blockedReason || 'unknown';
+        const fixes = {
+          subscription_expired: 'Resubscribe or buy credits at https://sapling.ai/api_settings#billing (or email support@sapling.ai)',
+          key_expired: 'Renew the subscription or buy credits at https://sapling.ai/api_settings#billing',
+          credits_depleted: 'Buy more prepaid credits at https://sapling.ai/api_settings#billing',
+          monthly_billing_limit: 'Raise the monthly billing limit at https://sapling.ai/api_settings#billing',
+          trial_daily_limit: 'Free-trial daily limit reached — clears at UTC midnight (or buy credits)',
+          monthly_quota_exhausted: 'Monthly quota used — resets at the start of next UTC month',
+        };
+        console.log(`  ❌ blocked: ${reason}`);
+        if (acct.message) console.log(`  ${acct.message}`);
+        console.log(`  fix: ${fixes[reason] || 'check https://sapling.ai/api_settings'}`);
+        if (acct.subscription) console.log(`  plan: active=${acct.subscription.active} trial_only=${acct.subscription.trial_only} key_expired=${acct.subscription.key_expired}`);
+      }
+      console.log('');
+      console.log(`Fallback chain (zero-maintenance): ${st.chain.length ? st.chain.join(' → ') : '(nothing available → LLM judge)'}`);
+      if (probe.ok) console.log(`  live probe → ${probe.provider} scored sample text ${probe.ai}% AI`);
+      else console.log(`  live probe failed: ${probe.error}`);
+      return;
+    }
+    const setIdx = args.indexOf('--set');
+    if (setIdx !== -1 && args[setIdx + 1]) {
+      const key = args[setIdx + 1];
+      const provider = (cfg.detector?.provider || 'sapling').toLowerCase();
+      const fieldMap = {
+        gptzero: 'gptzeroApiKey',
+        huggingface: 'hfToken',
+        kiprio: 'kiprioApiKey',
+        wasitai: 'wasitaiApiKey',
+        contentdetector: 'contentdetectorApiKey',
+        sapling: 'saplingApiKey',
+      };
+      const field = fieldMap[provider] || 'saplingApiKey';
+      saveConfig({ detector: { [field]: key, enabled: true } });
+      console.log(`✅ Detector key saved for ${provider}. Restart the bot: systemctl --user restart humanize-bot`);
+      return;
+    }
+    const pIdx = args.indexOf('--provider');
+    if (pIdx !== -1 && args[pIdx + 1]) {
+      const provider = args[pIdx + 1].toLowerCase();
+      if (!PROVIDERS.includes(provider)) {
+        console.error(`Unknown detector provider: ${provider}. Valid: ${PROVIDERS.join(', ')}`);
+        process.exit(1);
+      }
+      saveConfig({ detector: { provider } });
+      console.log(`✅ Detector provider set to ${provider}.`);
+      return;
+    }
+    if (args.includes('--disable')) {
+      saveConfig({ detector: { enabled: false } });
+      console.log('⛔ Detector disabled (falls back to the LLM judge).');
+      return;
+    }
+    if (args.includes('--enable')) {
+      saveConfig({ detector: { enabled: true } });
+      console.log('✅ Detector enabled.');
+      return;
+    }
+    const st = detectorStatus(loadConfig());
+    console.log('AI detector (judge/eval signal in robustAnalyze):');
+    console.log('─'.repeat(50));
+    console.log(`  enabled:  ${st.enabled ? 'yes' : 'no'}`);
+    console.log(`  provider: ${st.provider}`);
+    console.log(`  key:      ${st.keySet ? (st.keyMasked || (st.keyOptional ? 'not needed (free, no key)' : 'NOT SET — falls back to LLM judge')) : 'NOT SET — falls back to LLM judge'}`);
+    console.log(`  weight:   ${st.weight} base blend (rises toward 0.8 when the detector is decisive — 0 or 100)`);
+    console.log(`  endpoint: ${st.endpoint}`);
+    console.log(`  fallback: ${st.fallback ? 'on — auto-failover across free providers' : 'off — strict single provider'}`);
+    console.log(`  chain:    ${st.chain.length ? st.chain.join(' → ') : '(nothing available — LLM judge will be used)'}`);
+    console.log('');
+    console.log('  sapling         = free dev key (expires ~1mo), best accuracy   https://sapling.ai/api_settings');
+    console.log('  huggingface     = free HF read token (long-lived)              https://huggingface.co/settings/tokens');
+    console.log('  contentdetector = FREE, no key needed                          https://contentdetector.net/api');
+    console.log('  kiprio          = free tier (key optional)                     https://kiprio.com/ai-detect-api');
+    console.log('  wasitai         = free 1,000 credits                           https://www.wasitaigenerated.com/ai-detector-api');
+    console.log('  gptzero         = paid Professional API key                    https://gptzero.me/developers');
+    console.log('');
+    console.log('Set key:  humanize-ai detector --set <api_key>');
+    console.log('Switch:   humanize-ai detector --provider sapling|huggingface|contentdetector|kiprio|wasitai|gptzero');
+    return;
+  }
+
+  if (!resolveApiKey()) {
+    console.error('No OpenRouter credential found. Run `humanize-ai login` or `ori login`.');
+    process.exit(1);
+  }
+
+  if (cmd === 'analyze' || cmd === 'humanize' || cmd === 'report') {
+    const inputPath = args[1];
+    let style = cfg.style || 'normal';
+    const styleIdx = args.indexOf('--style');
+    if (styleIdx !== -1 && args[styleIdx + 1]) {
+      style = args[styleIdx + 1].toLowerCase();
+      if (!['normal', 'clear-structured'].includes(style)) {
+        console.error('Invalid --style. Valid: normal, clear-structured');
+        process.exit(1);
+      }
+    }
+    const rOpts = {
+      mode: cfg.routingMode ?? 'lmstudio-first',
+      lmModel: cfg.lmModel,
+      orModel: cfg.orModel,
+      aiThreshold: cfg.aiThreshold,
+      style,
+    };
+    if (cfg.lmstudioUrl) rOpts.lmstudioUrl = cfg.lmstudioUrl;
+    console.error(`Routing: ${rOpts.mode} (@ ${cfg.lmstudioUrl}) -> OpenRouter ${cfg.orModel} | style: ${style}`);
+
+    let input, inputFormatting;
+    if (inputPath && fs.existsSync(inputPath)) {
+      const doc = await readDocument(inputPath);
+      input = doc.text;
+      inputFormatting = doc.formatting;
+      console.error(`Read ${path.basename(inputPath)} (${doc.format} format, font: ${inputFormatting.font}, size: ${inputFormatting.sizePt}pt)`);
+    } else {
+      input = readInput(inputPath);
+      inputFormatting = { font: 'Times New Roman', sizePt: 11, sizeHalfPt: 22 };
+    }
+
+    const before = await robustAnalyze(input, cfg.model, rOpts);
+    console.error(`Original: AI ${before.combined.ai_likelihood}%, plagiarism ${before.combined.plagiarism_likelihood ?? 'n/a'}% (heuristic ${before.heuristic.score}%) [${before.provider}]`);
+    if (before.heuristic.grammarlyFlags?.length) {
+      console.error(`Grammarly flags: ${before.heuristic.grammarlyFlags.slice(0, 5).join(', ')}`);
+    }
+
+    if (cmd === 'analyze') {
+      console.log(JSON.stringify(before, null, 2));
+      return;
+    }
+
+    const isDocxInput = !!(inputPath && fs.existsSync(inputPath) && path.extname(inputPath).toLowerCase() === '.docx');
+
+    console.error('Humanizing (multi-pass with LLM verification)...');
+    let out;
+    if (isDocxInput) {
+      const chunkCallback = async (chunk) => {
+        const r = await humanize(chunk, cfg.model, rOpts);
+        return r.text;
+      };
+      out = await humanizeDocxPreserve(fs.readFileSync(inputPath), chunkCallback);
+      console.error(`Docx humanized in place (${out.chunksProcessed} chunk(s), ${out.paragraphsProcessed}/${out.totalParagraphs} paragraphs rewritten)`);
+    } else {
+      out = await humanize(input, cfg.model, rOpts);
+      console.error(`Completed in ${out.passes} pass(es), heuristic score: ${out.heuristicScore}%`);
+    }
+
+    const after = await robustAnalyze(out.text, cfg.model, rOpts);
+    console.error(`Humanized: AI ${after.combined.ai_likelihood}%, plagiarism ${after.combined.plagiarism_likelihood ?? 'n/a'}% (heuristic ${after.heuristic.score}%) [${after.provider}]`);
+    if (after.heuristic.grammarlyFlags?.length) {
+      console.error(`Grammarly flags: ${after.heuristic.grammarlyFlags.slice(0, 5).join(', ')}`);
+    }
+
+    let format = 'docx';
+    let outPath = null;
+    for (let i = 1; i < args.length; i++) {
+      if (args[i] === '--format' && args[i + 1]) { format = args[i + 1]; i++; }
+      if (args[i] === '-o' && args[i + 1]) { outPath = args[i + 1]; i++; }
+    }
+
+    if (cmd === 'report') {
+      console.log(writeComparableReport(input, out.text, before, after, { aiThreshold: cfg.aiThreshold, plagiarismThreshold: cfg.plagiarismThreshold }));
+    }
+
+    if (!outPath) {
+      const baseName = inputPath ? path.basename(inputPath, path.extname(inputPath)) : 'humanized';
+      outPath = `${baseName}-humanized.${format}`;
+    }
+    if ((format === 'docx' || outPath.endsWith('.docx')) && !outPath.endsWith('.docx')) outPath += '.docx';
+
+    if (isDocxInput && (format === 'docx' || outPath.endsWith('.docx'))) {
+      fs.writeFileSync(outPath, out.buffer);
+      console.error(`\nHumanized document written to ${path.resolve(outPath)} (original formatting, images, tables, borders preserved in-place)`);
+    } else if (format === 'docx' || outPath.endsWith('.docx')) {
+      await writeHumanizedDocx(out.text, inputPath || '', outPath);
+      console.error(`\nHumanized document written to ${path.resolve(outPath)} (fonts preserved from original)`);
+    } else {
+      fs.writeFileSync(outPath, out.text);
+      console.error(`\nHumanized text written to ${path.resolve(outPath)}`);
+    }
+
+    if (cmd !== 'report') {
+      console.log(out.text);
+    }
+    return;
+  }
+
+  console.error('Unknown command: ' + cmd);
+  console.log(USAGE);
+  process.exit(1);
+}
+
+main().catch(e => { console.error('Error:', e.message); process.exit(1); });
