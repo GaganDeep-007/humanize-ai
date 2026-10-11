@@ -13,8 +13,21 @@ laya-service/__pycache__/
 # Secrets / local environment
 .env
 .env.*
+!.env.example
 *.local
+*.env
+*.env.*
+!.env.example
+*.key
 *.pem
+*.p12
+.aws/
+.gcloud/
+database.yml
+*.sqlite
+*.sqlite3
+~/.ori/
+~/.groq/
 
 # Logs
 *.log
